@@ -136,6 +136,7 @@ public final class TransientStorage {
     }
 
     public void setAppletSelected() {
+        setBoolByIdx(BOOL_IDX_AUTHENTICATOR_DISABLED, false);
         setBoolByIdx(BOOL_IDX_APPLET_SELECTED, true);
     }
 
@@ -233,13 +234,8 @@ public final class TransientStorage {
     }
 
     public void clearOnDeselect() {
-        // Restore platform-key-set state afterwards: we want to preserve that across deselects
-        boolean platformKeySetState = isPlatformKeySet();
         // Note: fill starts from index 1, skipping the pin-retries-since-reset counter
         Util.arrayFillNonAtomic(tempBytes, (short) 1, (short)(NUM_RESET_BYTES - 1), (byte) 0x00);
-        if (platformKeySetState) {
-            setPlatformKeySet();
-        }
     }
 
     public void readyStoredVars() {
@@ -260,9 +256,13 @@ public final class TransientStorage {
     }
 
     public void defaultOptions() {
+        defaultOptions(false);
+    }
+
+    public void defaultOptions(boolean defaultRK) {
         setBoolByIdx(BOOL_IDX_OPTION_UP, true);
         setBoolByIdx(BOOL_IDX_OPTION_UV, false);
-        setBoolByIdx(BOOL_IDX_OPTION_RK, false);
+        setBoolByIdx(BOOL_IDX_OPTION_RK, defaultRK);
     }
 
     public boolean hasRKOption() {

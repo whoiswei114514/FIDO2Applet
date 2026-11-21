@@ -47,6 +47,8 @@ if __name__ == '__main__':
                         help="Obtained FIDO Alliance certification level")
     parser.add_argument('--attestation-private-key',
                         help="Base64-encoded RAW (32 byte) private key for attestation certificate. Implies --enable-attestation")
+    parser.add_argument('--non-discoverable-default', action='store_false', default=None,
+                        help="Default to non-discoverable credentials when options.rk is omitted (default is discoverable)")
 
     args = parser.parse_args()
 
@@ -85,7 +87,8 @@ if __name__ == '__main__':
         'cache_pin_token',
         'certification_level',
         'attestation_private_key',
-        'multiple_writes_per_pin_token'
+        'multiple_writes_per_pin_token',
+        'non_discoverable_default'
     ]):
         val = getattr(args, option_string)
         if val is None:

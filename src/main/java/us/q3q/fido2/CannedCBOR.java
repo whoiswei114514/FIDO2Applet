@@ -85,7 +85,7 @@ public abstract class CannedCBOR {
                             (byte) 0xF5, // true
                         0x62, // string: two bytes long
                             0x75, 0x70, // up
-                            (byte) 0xF4, // false
+                            (byte) 0xF5, // true
                         0x66, // string: six bytes long
                             0x75, 0x76, 0x41, 0x63, 0x66, 0x67, // uvAcfg
                             (byte) 0xF5, // true

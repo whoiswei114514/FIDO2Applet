@@ -64,6 +64,11 @@ public final class FIDO2Applet extends Applet implements ExtendedLength {
      */
     private boolean USE_LOW_SECURITY_FOR_SOME_RKS;
     /**
+     * If true, default to discoverable (resident) credentials when options.rk is omitted,
+     * while still accepting explicit options.rk=false non-discoverable credentials.
+     */
+    private boolean DEFAULT_DISCOVERABLE;
+    /**
      * If true, performing ANY operation with a PIN/UV token invalidates it, requiring new
      * authentication for each operation.
      */
@@ -91,6 +96,10 @@ public final class FIDO2Applet extends Applet implements ExtendedLength {
      * How many resident key slots to allocate in one go
      */
     private static final short NUM_RESIDENT_KEY_SLOTS_PER_BATCH = 10;
+    /**
+     * Maximum number of discoverable (resident) credentials allowed on the authenticator
+     */
+    private static final short MAX_RESIDENT_KEYS = 40;
     /**
      * Length of initialization vector for key encryption/decryption
      */
@@ -836,6 +845,10 @@ public final class FIDO2Applet extends Applet implements ExtendedLength {
             pinAuthSuccess = true;
         }
 
+        if (transientStorage.hasUVOption()) {
+            sendErrorByte(apdu, FIDOConstants.CTAP2_ERR_INVALID_OPTION);
+        }
+
         if (!pinAuthSuccess) {
             if (alwaysUv || (pinSet && transientStorage.hasRKOption() && !USE_LOW_SECURITY_FOR_SOME_RKS)) {
                 // PIN is set, but no PIN-auth option was provided
@@ -990,6 +1003,10 @@ public final class FIDO2Applet extends Applet implements ExtendedLength {
                 }
             }
 
+            if (!foundMatchingRK && numResidentCredentials >= MAX_RESIDENT_KEYS) {
+                sendErrorByte(apdu, FIDOConstants.CTAP2_ERR_KEY_STORE_FULL);
+            }
+
             short availableMem = JCSystem.getAvailableMemory(JCSystem.MEMORY_TYPE_PERSISTENT);
 
             if (targetRKSlot == -1) {
@@ -998,6 +1015,12 @@ public final class FIDO2Applet extends Applet implements ExtendedLength {
 
                 short oldSize = (short) residentKeys.length;
                 short newSize = (short)(oldSize + NUM_RESIDENT_KEY_SLOTS_PER_BATCH);
+                if (newSize > MAX_RESIDENT_KEYS) {
+                    newSize = MAX_RESIDENT_KEYS;
+                }
+                if (oldSize >= newSize) {
+                    sendErrorByte(apdu, FIDOConstants.CTAP2_ERR_KEY_STORE_FULL);
+                }
 
                 if (availableMem >= 0 && availableMem < (short)(newSize * 16)) {
                     // Too close to the limit for safety
@@ -2191,8 +2214,8 @@ public final class FIDO2Applet extends Applet implements ExtendedLength {
                 stateKeepingBuffer[(short)(stateKeepingIdx + 1)] |= 0x01;
             }
 
-            if (pinSet && pinProvided && transientStorage.hasUVOption()) {
-                // When a PIN is set and provided, the "uv" input option MUST NOT be set.
+            if (transientStorage.hasUVOption()) {
+                // Built-in "uv" option is not supported; platforms must use clientPin / pinUvAuthParam.
                 sendErrorByte(apdu, FIDOConstants.CTAP2_ERR_INVALID_OPTION);
             }
 
@@ -2611,7 +2634,7 @@ public final class FIDO2Applet extends Applet implements ExtendedLength {
      * Sets in-memory variables capturing possible incoming CTAP options to their default values
      */
     private void defaultOptions() {
-        transientStorage.defaultOptions();
+        transientStorage.defaultOptions(DEFAULT_DISCOVERABLE);
     }
 
     /**
@@ -3076,6 +3099,10 @@ public final class FIDO2Applet extends Applet implements ExtendedLength {
         if (amountFitInBuffer > apduBlockSize) {
             amountFitInBuffer = apduBlockSize;
         }
+        final byte[] apduBytes = apdu.getBuffer();
+        if (amountFitInBuffer > (short)(apduBytes.length - 2)) {
+            amountFitInBuffer = (short)(apduBytes.length - 2);
+        }
 
         short amountFromMem = amountFitInBuffer;
         if (amountFromMem > outputLen) {
@@ -3087,7 +3114,6 @@ public final class FIDO2Applet extends Applet implements ExtendedLength {
         } else {
             apdu.setOutgoingLength(amountFitInBuffer);
         }
-        final byte[] apduBytes = apdu.getBuffer();
         Util.arrayCopyNonAtomic(bufferMem, (short) 0,
                 apduBytes, (short) 0, amountFromMem);
         if (x5c) {
@@ -3485,9 +3511,10 @@ public final class FIDO2Applet extends Applet implements ExtendedLength {
             ISOException.throwIt(ISO7816.SW_INS_NOT_SUPPORTED);
         }
 
-        if (cla_ins == (short) 0x8012 && p1_p2 == (short) 0x0100) {
-            // Explicit disable command (NFCCTAP_CONTROL end CTAP_MSG). Turn off, and stay off.
+        if (cla_ins == (short) 0x8012 && (p1_p2 == (short) 0x0000 || p1_p2 == (short) 0x0100)) {
+            // Explicit disable command (NFCCTAP_DESELECT / NFCCTAP_CONTROL). Turn off until next reselect.
             transientStorage.disableAuthenticator();
+            return;
         }
 
         if (transientStorage.authenticatorDisabled()) {
@@ -3588,8 +3615,6 @@ public final class FIDO2Applet extends Applet implements ExtendedLength {
             return;
         }
 
-        initKeyAgreementKeyIfNecessary();
-
         if (apduBytes[ISO7816.OFFSET_CLA] != (byte) 0x80) {
             throwException(ISO7816.SW_CLA_NOT_SUPPORTED);
         }
@@ -3661,6 +3686,7 @@ public final class FIDO2Applet extends Applet implements ExtendedLength {
                 getAssertion(apdu, Short.MAX_VALUE, null, transientStorage.getAssertIterationPointer());
                 break;
             case FIDOConstants.CMD_CLIENT_PIN:
+                initKeyAgreementKeyIfNecessary();
                 reqBuffer = fullyReadReq(apdu, lc, amtRead, true);
 
                 clientPINSubcommand(apdu, reqBuffer, lcEffective);
@@ -4214,7 +4240,7 @@ public final class FIDO2Applet extends Applet implements ExtendedLength {
                 (short) -1, true, (byte) 0);
 
         // Generate signature first. Use bufMem as working space
-        final short baseAdOffset = 512;
+        final short baseAdOffset = 0;
         short adOffset = baseAdOffset;
         final byte[] adBuffer = bufferMem;
         adBuffer[adOffset++] = 0x00; // Fixed magic byte
@@ -4299,6 +4325,9 @@ public final class FIDO2Applet extends Applet implements ExtendedLength {
         }
 
         short chunkSize = (short)(APDU.getOutBlockSize() - 2);
+        if (chunkSize > (short)(apduBytes.length - 2)) {
+            chunkSize = (short)(apduBytes.length - 2);
+        }
         if (chaining) {
             final short requestedChunkSize = apdu.setOutgoing();
             if (requestedChunkSize < chunkSize) {
@@ -5748,13 +5777,18 @@ public final class FIDO2Applet extends Applet implements ExtendedLength {
      *
      * @return Estimated number of creds
      */
-    private static byte getApproximateRemainingKeyCount() {
+    private byte getApproximateRemainingKeyCount() {
+        final short remainingByCap = (short)(MAX_RESIDENT_KEYS - numResidentCredentials);
+        if (remainingByCap <= 0) {
+            return 0;
+        }
         short availableMem = JCSystem.getAvailableMemory(JCSystem.MEMORY_TYPE_PERSISTENT);
         if (availableMem < 0) {
             availableMem = Short.MAX_VALUE;
         }
         final short approx = (short)(availableMem / APPROXIMATE_STORAGE_PER_RESIDENT_KEY);
-        return (byte)(approx > 100 ? 100 : approx);
+        final short remaining = approx < remainingByCap ? approx : remainingByCap;
+        return (byte)(remaining > 100 ? 100 : remaining);
     }
 
     /**
@@ -6876,6 +6910,7 @@ public final class FIDO2Applet extends Applet implements ExtendedLength {
         FLASH_SCRATCH_SIZE = 1024;
         STORE_PIN_LENGTH = true;
         CERTIFICATION_LEVEL = 0;
+        DEFAULT_DISCOVERABLE = true;
 
         // Next, read any overrides
         final short initOffset = offset;
@@ -6985,6 +7020,9 @@ public final class FIDO2Applet extends Applet implements ExtendedLength {
                         break;
                     case 0x10:
                         WRITES_INVALIDATE_PINS = array[offset++] == (byte) 0xF5;
+                        break;
+                    case 0x11:
+                        DEFAULT_DISCOVERABLE = array[offset++] == (byte) 0xF5;
                         break;
                     default:
                         ISOException.throwIt(ISO7816.SW_WRONG_DATA);
