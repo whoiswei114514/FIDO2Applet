@@ -497,6 +497,10 @@ public final class FIDO2Applet extends Applet implements ExtendedLength {
         }
 
         // Buffering read case
+        if (chainOff > (short) (bufferMem.length - amtRead)) {
+            transientStorage.resetChainIncomingReadOffset();
+            sendErrorByte(apdu, FIDOConstants.CTAP2_ERR_REQUEST_TOO_LARGE);
+        }
         Util.arrayCopyNonAtomic(buffer, apdu.getOffsetCdata(),
                 bufferMem, chainOff, amtRead);
 
@@ -508,7 +512,8 @@ public final class FIDO2Applet extends Applet implements ExtendedLength {
                 throwException(ISO7816.SW_WRONG_LENGTH);
             }
 
-            if (curRead > (short) (bufferMem.length - read)) {
+            if ((short) (curRead + chainOff) > (short) (bufferMem.length - read)) {
+                transientStorage.resetChainIncomingReadOffset();
                 sendErrorByte(apdu, FIDOConstants.CTAP2_ERR_REQUEST_TOO_LARGE);
             }
             Util.arrayCopyNonAtomic(buffer, (short) 0,
@@ -3093,7 +3098,7 @@ public final class FIDO2Applet extends Applet implements ExtendedLength {
         }
 
         short amountFitInBuffer = totalOutputLen;
-        if (amountFitInBuffer > expectedLen) {
+        if (expectedLen > 0 && amountFitInBuffer > expectedLen) {
             amountFitInBuffer = expectedLen;
         }
         if (amountFitInBuffer > apduBlockSize) {
@@ -3102,6 +3107,9 @@ public final class FIDO2Applet extends Applet implements ExtendedLength {
         final byte[] apduBytes = apdu.getBuffer();
         if (amountFitInBuffer > (short)(apduBytes.length - 2)) {
             amountFitInBuffer = (short)(apduBytes.length - 2);
+        }
+        if (!isExtendedAPDU && amountFitInBuffer > (short) 256) {
+            amountFitInBuffer = (short) 256;
         }
 
         short amountFromMem = amountFitInBuffer;
@@ -4330,8 +4338,10 @@ public final class FIDO2Applet extends Applet implements ExtendedLength {
         }
         if (chaining) {
             final short requestedChunkSize = apdu.setOutgoing();
-            if (requestedChunkSize < chunkSize) {
+            if (requestedChunkSize > 0 && requestedChunkSize < chunkSize) {
                 chunkSize = requestedChunkSize;
+            } else if (requestedChunkSize == 0 && chunkSize > (short) 256) {
+                chunkSize = (short) 256;
             }
         }
 
@@ -5607,9 +5617,7 @@ public final class FIDO2Applet extends Applet implements ExtendedLength {
      * @param apdu Request/response object
      */
     private void sendAuthInfo(APDU apdu) {
-        byte[] buffer = apdu.getBuffer();
-        boolean longResponse = apdu.getOffsetCdata() == ISO7816.OFFSET_EXT_CDATA;
-
+        final byte[] buffer = bufferMem;
         short offset = 0;
 
         short numOptions = 0x00B0;
@@ -5691,33 +5699,7 @@ public final class FIDO2Applet extends Applet implements ExtendedLength {
         buffer[offset++] = 0x07; // map key: maxCredentialCountInList
         buffer[offset++] = 0x17; // twenty-three
 
-        final short amountInApduBuf = offset;
-
         final byte approximateKeyCount = getApproximateRemainingKeyCount();
-        boolean partiallySent = false;
-        if (!longResponse) {
-            // We're going to have too much for one 256-byte buffer
-            // So let's split into two halves, one directly APDU-written and one saved
-            buffer = bufferMem;
-            offset = 0;
-        } else if (apdu.getBuffer().length > 300) {
-            // We have an E-APDU, but there's room for our reply in the
-            // APDU outgoing buffer: keep writing
-        } else {
-            // We have an E-APDU, buf there's not room for our response in the outgoing
-            // buffer. Write aside.
-            final short remainingAmountToWrite = (short)(CannedCBOR.ES256_ALG_TYPE.length
-                    + (approximateKeyCount > 23 ? 2 : 1) // encoded length of approxKeyCount
-                    + (minPinLength > 23 ? 2 : 1) // encoded length of minPinLength
-                    + 23 // fixed overhead;
-            );
-            apdu.setOutgoing();
-            apdu.setOutgoingLength((short)(offset + remainingAmountToWrite));
-            apdu.sendBytes((short) 0, offset);
-            // And overwrite the same buffer again
-            offset = 0;
-            partiallySent = true;
-        }
 
         buffer[offset++] = 0x08; // map key: maxCredentialIdLength: 1 byte
         offset = encodeIntTo(buffer, offset, (byte) CREDENTIAL_ID_LEN); // 2 bytes = 3
@@ -5759,17 +5741,7 @@ public final class FIDO2Applet extends Applet implements ExtendedLength {
         buffer[offset++] = 0x14; // map key: remainingDiscoverableCredentials: 1 byte = 23
         offset = encodeIntTo(buffer, offset, approximateKeyCount); // variable
 
-        if (longResponse) {
-            if (partiallySent) {
-                bufferManager.clear();
-                apdu.sendBytes((short) 0, offset);
-            } else {
-                sendNoCopy(apdu, offset);
-            }
-        } else {
-            sendNoCopy(apdu, amountInApduBuf);
-            setupChainedResponse((short) 0, offset);
-        }
+        doSendResponse(apdu, offset);
     }
 
     /**
@@ -6478,84 +6450,151 @@ public final class FIDO2Applet extends Applet implements ExtendedLength {
      */
     private short consumeKeyAgreement(APDU apdu, byte[] buffer, short readIdx, byte pinProtocol,
                                       short lc) {
+        if ((short)(readIdx + 1) >= lc) {
+            sendErrorByte(apdu, FIDOConstants.CTAP2_ERR_INVALID_CBOR);
+        }
         if (buffer[readIdx++] != (byte) 0xA5) { // map, with five entries
             sendErrorByte(apdu, FIDOConstants.CTAP2_ERR_MISSING_PARAMETER);
         }
+        final short preamblePrefixLen = (short)(CannedCBOR.PUBLIC_KEY_DH_ALG_PREAMBLE.length - 2);
+        if ((short)(readIdx + preamblePrefixLen) >= lc) {
+            sendErrorByte(apdu, FIDOConstants.CTAP2_ERR_INVALID_CBOR);
+        }
         if (Util.arrayCompare(buffer, readIdx,
-                CannedCBOR.PUBLIC_KEY_DH_ALG_PREAMBLE, (short) 0, (short) CannedCBOR.PUBLIC_KEY_DH_ALG_PREAMBLE.length) != 0) {
+                CannedCBOR.PUBLIC_KEY_DH_ALG_PREAMBLE, (short) 0, preamblePrefixLen) != 0) {
             sendErrorByte(apdu, FIDOConstants.CTAP2_ERR_UNSUPPORTED_ALGORITHM);
         }
-        readIdx += (short) CannedCBOR.PUBLIC_KEY_DH_ALG_PREAMBLE.length;
+        readIdx += preamblePrefixLen;
+
+        short xLen = 0;
+        final short xType = ub(buffer[readIdx++]);
+        if (xType == 0x0058) { // byte string, one-byte length
+            if (readIdx >= lc) {
+                sendErrorByte(apdu, FIDOConstants.CTAP2_ERR_INVALID_CBOR);
+            }
+            xLen = ub(buffer[readIdx++]);
+        } else if (xType >= 0x0041 && xType <= 0x0057) {
+            xLen = (short)(xType - 0x0040);
+        } else {
+            sendErrorByte(apdu, FIDOConstants.CTAP2_ERR_CBOR_UNEXPECTED_TYPE);
+        }
+        if (xLen <= 0 || xLen > KEY_POINT_LENGTH) {
+            sendErrorByte(apdu, FIDOConstants.CTAP2_ERR_CBOR_UNEXPECTED_TYPE);
+        }
 
         short xIdx = readIdx;
-        readIdx += KEY_POINT_LENGTH;
-        if (readIdx > lc) {
+        readIdx += xLen;
+        if (readIdx >= lc) {
             sendErrorByte(apdu, FIDOConstants.CTAP2_ERR_INVALID_CBOR);
         }
         if (buffer[readIdx++] != 0x22) { // map key: y-point
             sendErrorByte(apdu, FIDOConstants.CTAP2_ERR_CBOR_UNEXPECTED_TYPE);
         }
-        if (buffer[readIdx++] != 0x58) { // byte string, one-byte length
+        if (readIdx >= lc) {
+            sendErrorByte(apdu, FIDOConstants.CTAP2_ERR_INVALID_CBOR);
+        }
+
+        short yLen = 0;
+        final short yType = ub(buffer[readIdx++]);
+        if (yType == 0x0058) { // byte string, one-byte length
+            if (readIdx >= lc) {
+                sendErrorByte(apdu, FIDOConstants.CTAP2_ERR_INVALID_CBOR);
+            }
+            yLen = ub(buffer[readIdx++]);
+        } else if (yType >= 0x0041 && yType <= 0x0057) {
+            yLen = (short)(yType - 0x0040);
+        } else {
             sendErrorByte(apdu, FIDOConstants.CTAP2_ERR_CBOR_UNEXPECTED_TYPE);
         }
-        if (buffer[readIdx++] != KEY_POINT_LENGTH) {
+        if (yLen <= 0 || yLen > KEY_POINT_LENGTH) {
             sendErrorByte(apdu, FIDOConstants.CTAP2_ERR_CBOR_UNEXPECTED_TYPE);
         }
 
         short yIdx = readIdx;
-        readIdx += KEY_POINT_LENGTH;
+        readIdx += yLen;
         if (readIdx > lc) {
             sendErrorByte(apdu, FIDOConstants.CTAP2_ERR_INVALID_CBOR);
         }
 
         final short fullKeyLength = KEY_POINT_LENGTH * 2 + 1;
+        short kpHandle = -1;
+        byte[] secretBuf;
+        short secretOffset;
+        short rawSecretLength;
 
-        // Pack the public key into a nice compact representation (mangling the buffer)
-        short kpStart = (short)(yIdx - KEY_POINT_LENGTH - 1);
-        Util.arrayCopyNonAtomic(buffer, xIdx,
-                buffer, (short)(kpStart + 1), KEY_POINT_LENGTH); // place X just before Y and just after header
-        buffer[kpStart] = 0x04; // "Uncompressed" EC point format - this idx is no longer in the x-point after we moved it
+        if (xLen == KEY_POINT_LENGTH && yLen == KEY_POINT_LENGTH) {
+            // Pack the public key into a nice compact representation (mangling the buffer)
+            short kpStart = (short)(yIdx - KEY_POINT_LENGTH - 1);
+            Util.arrayCopyNonAtomic(buffer, xIdx,
+                    buffer, (short)(kpStart + 1), KEY_POINT_LENGTH); // place X just before Y and just after header
+            buffer[kpStart] = 0x04; // "Uncompressed" EC point format - this idx is no longer in the x-point after we moved it
 
-        final short secretOffset = (short)(readIdx - KEY_POINT_LENGTH);
+            secretBuf = buffer;
+            secretOffset = (short)(readIdx - KEY_POINT_LENGTH);
 
-        // DH-generate the shared secret... (overwriting the public key we just put in the buffer)
-        short rawSecretLength = keyAgreement.generateSecret(
-                buffer, kpStart, fullKeyLength,
-                buffer, secretOffset
-        );
+            // DH-generate the shared secret... (overwriting the public key we just put in the buffer)
+            rawSecretLength = keyAgreement.generateSecret(
+                    buffer, kpStart, fullKeyLength,
+                    buffer, secretOffset
+            );
 
-        bufferManager.informAPDUBufferAvailability(apdu, secretOffset);
+            bufferManager.informAPDUBufferAvailability(apdu, secretOffset);
+        } else {
+            // Left-pad short coordinates (< 32B from non-zero-padded BigInteger encodings) to full P-256 point
+            kpHandle = bufferManager.allocate(apdu, (short)(fullKeyLength + KEY_POINT_LENGTH), BufferManager.ANYWHERE);
+            secretBuf = bufferManager.getBufferForHandle(apdu, kpHandle);
+            final short kpOff = bufferManager.getOffsetForHandle(kpHandle);
+            Util.arrayFillNonAtomic(secretBuf, kpOff, fullKeyLength, (byte) 0x00);
+            secretBuf[kpOff] = 0x04;
+            Util.arrayCopyNonAtomic(buffer, xIdx,
+                    secretBuf, (short)(kpOff + 1 + KEY_POINT_LENGTH - xLen), xLen);
+            Util.arrayCopyNonAtomic(buffer, yIdx,
+                    secretBuf, (short)(kpOff + 1 + KEY_POINT_LENGTH + KEY_POINT_LENGTH - yLen), yLen);
+
+            secretOffset = (short)(kpOff + fullKeyLength);
+            rawSecretLength = keyAgreement.generateSecret(
+                    secretBuf, kpOff, fullKeyLength,
+                    secretBuf, secretOffset
+            );
+        }
 
         if (pinProtocol == 1) {
             // This was a "plain" DH so we need to sha256 the result to get the real secret
-            short sharedSecretLength = sha256.doFinal(buffer, secretOffset, rawSecretLength,
-                    buffer, secretOffset);
+            short sharedSecretLength = sha256.doFinal(secretBuf, secretOffset, rawSecretLength,
+                    secretBuf, secretOffset);
 
             // Now, finally, the shared secret is ready!
-            sharedSecretAESKey.setKey(buffer, secretOffset);
-            Util.arrayCopyNonAtomic(buffer, secretOffset,
+            sharedSecretAESKey.setKey(secretBuf, secretOffset);
+            Util.arrayCopyNonAtomic(secretBuf, secretOffset,
                     sharedSecretVerifyKey, (short) 0, sharedSecretLength);
         } else if (pinProtocol == 2) {
             // HKDF step one: get PRK by using zeros as a key to HMAC-SHA256 the IKM
             hmacSha256(apdu, FIDOConstants.ZERO_SALT, (short) 0,
-                    buffer, secretOffset, rawSecretLength,
-                    buffer, secretOffset
+                    secretBuf, secretOffset, rawSecretLength,
+                    secretBuf, secretOffset
             );
 
             // HKDF step two (for HMAC key): use PRK as key to HMAC-SHA256 a different magic info string (plus a 0x01 byte)
-            hmacSha256(apdu, buffer, secretOffset,
+            hmacSha256(apdu, secretBuf, secretOffset,
                     FIDOConstants.CTAP2_HMAC_KEY_INFO, (short) 0, (short) FIDOConstants.CTAP2_HMAC_KEY_INFO.length,
                     sharedSecretVerifyKey, (short) 0
             );
 
             // HKDF step two (for AES key): use PRK as key to HMAC-SHA256 a magic info string (plus a 0x01 byte)
-            hmacSha256(apdu, buffer, secretOffset,
+            hmacSha256(apdu, secretBuf, secretOffset,
                     FIDOConstants.CTAP2_AES_KEY_INFO, (short) 0, (short) FIDOConstants.CTAP2_AES_KEY_INFO.length,
-                    buffer, secretOffset
+                    secretBuf, secretOffset
             );
-            sharedSecretAESKey.setKey(buffer, secretOffset);
+            sharedSecretAESKey.setKey(secretBuf, secretOffset);
         } else {
+            if (kpHandle != -1) {
+                bufferManager.release(apdu, kpHandle, (short)(fullKeyLength + KEY_POINT_LENGTH));
+            }
             sendErrorByte(apdu, FIDOConstants.CTAP1_ERR_INVALID_PARAMETER);
+        }
+
+        if (kpHandle != -1) {
+            bufferManager.release(apdu, kpHandle, (short)(fullKeyLength + KEY_POINT_LENGTH));
         }
 
         return readIdx;
